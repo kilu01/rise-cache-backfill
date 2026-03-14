@@ -293,10 +293,10 @@ where
             // We are the designated fetcher for this key.
             // capacity=1: we send exactly once; all current subscribers receive it.
             let (tx, _) = broadcast::channel(1);
-            e.insert(tx.clone());
             // Release the write lock now — new waiters can subscribe from this
             // point on and will block on rx.recv() until we call tx.send() below.
-            drop(e);
+            e.insert(tx.clone());
+
 
             let result = fetch_fn().await;
 

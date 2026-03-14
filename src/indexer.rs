@@ -24,12 +24,17 @@ struct Args {
     #[arg(long, env = "RPC_HTTP", default_value = "https://testnet.riselabs.xyz")]
     rpc_http: String,
 
-    /// RISE WebSocket endpoint — shreds subscription
     #[arg(long, env = "RPC_WS", default_value = "wss://testnet.riselabs.xyz/ws")]
     rpc_ws: String,
 
     #[arg(long, default_value = "10")]
     backfill_batch: u64,
+
+    #[arg(long)]
+    no_realtime: bool,
+
+    #[arg(long)]
+    no_backfill: bool,
 }
 
 #[tokio::main]
@@ -48,52 +53,51 @@ async fn main() -> Result<()> {
     let rpc = RpcClient::new(&args.rpc_http);
     let mut handles = vec![];
 
-    let pool_rt = pool.clone();
-    let ws_url = args.rpc_ws.clone();
-    handles.push(tokio::spawn(async move {
-        loop {
-            if let Err(e) = realtime_indexer(&pool_rt, &ws_url).await {
-                error!("Realtime indexer crashed: {:?}. Reconnecting in 5s...", e);
-                sleep(Duration::from_secs(5)).await;
+    if !args.no_realtime {
+        let pool_rt = pool.clone();
+        let ws_url = args.rpc_ws.clone();
+        handles.push(tokio::spawn(async move {
+            loop {
+                if let Err(e) = realtime_indexer(&pool_rt, &ws_url).await {
+                    error!("Realtime indexer crashed: {:?}. Reconnecting in 5s...", e);
+                    sleep(Duration::from_secs(5)).await;
+                }
             }
-        }
-    }));
+        }));
+    }
 
-    let pool_bf = pool.clone();
-    let rpc_bf = rpc.clone();
-    let batch = args.backfill_batch;
-    handles.push(tokio::spawn(async move {
-        loop {
-            if let Err(e) = backfill_indexer(&pool_bf, &rpc_bf, batch).await {
-                error!("Backfill error: {:?}. Retrying in 10s...", e);
-                sleep(Duration::from_secs(10)).await;
+    if !args.no_backfill {
+        let pool_bf = pool.clone();
+        let rpc_bf = rpc.clone();
+        let batch = args.backfill_batch;
+        handles.push(tokio::spawn(async move {
+            loop {
+                if let Err(e) = backfill_indexer(&pool_bf, &rpc_bf, batch).await {
+                    error!("Backfill error: {:?}. Retrying in 10s...", e);
+                    sleep(Duration::from_secs(10)).await;
+                }
+                sleep(Duration::from_secs(30)).await;
             }
-            sleep(Duration::from_secs(30)).await;
-        }
-    }));
+        }));
+    }
 
     for h in handles { let _ = h.await; }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Realtime: subscribe to "shreds" — RISE-specific sub delivering tx+receipt
-// data in milliseconds, with no extra RPC calls needed per transaction.
+// Realtime: subscribe to RISE shreds
 // ---------------------------------------------------------------------------
 async fn realtime_indexer(pool: &SqlitePool, ws_url: &str) -> Result<()> {
     info!("Connecting to WS: {}", ws_url);
     let (ws_stream, _) = connect_async(ws_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
-    // Subscribe to RISE shreds. The optional `true` second param enables
-    // stateChanges; we skip it since we only need tx/receipt data.
-    let sub_req = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
+    write.send(Message::Text(json!({
+        "jsonrpc": "2.0", "id": 1,
         "method": "eth_subscribe",
         "params": ["shreds"]
-    });
-    write.send(Message::Text(sub_req.to_string())).await?;
+    }).to_string())).await?;
     info!("Subscribed to shreds");
 
     while let Some(msg) = read.next().await {
@@ -104,7 +108,6 @@ async fn realtime_indexer(pool: &SqlitePool, ws_url: &str) -> Result<()> {
                     Err(e) => { warn!("WS parse error: {:?}", e); continue; }
                 };
 
-                // {"jsonrpc":"2.0","id":1,"result":"0x9ce59a..."}
                 if v.get("id").is_some() {
                     if let Some(sub_id) = v["result"].as_str() {
                         info!("Shred subscription confirmed: {}", sub_id);
@@ -112,13 +115,8 @@ async fn realtime_indexer(pool: &SqlitePool, ws_url: &str) -> Result<()> {
                     continue;
                 }
 
-                // {"jsonrpc":"2.0","method":"eth_subscription","params":{...}}
                 if v["method"].as_str() != Some("eth_subscription") { continue; }
-
                 let result = &v["params"]["result"];
-
-                // Distinguish shred notifications from other sub types (logs, newHeads)
-                // by the presence of the "shredIdx" field.
                 if result.get("shredIdx").is_none() { continue; }
 
                 match serde_json::from_value::<Shred>(result.clone()) {
@@ -128,8 +126,7 @@ async fn realtime_indexer(pool: &SqlitePool, ws_url: &str) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize shred: {:?}", e);
-                        warn!("Raw: {}", result);
+                        warn!("Failed to deserialize shred: {:?} | raw: {}", e, result);
                     }
                 }
             }
@@ -141,19 +138,9 @@ async fn realtime_indexer(pool: &SqlitePool, ws_url: &str) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Process one shred: persist all tx+receipts.
-//
-// Shreds contain BOTH transaction and receipt data inline — no extra RPC calls.
-// Shreds DON'T contain: block_hash, transaction_index, logs_bloom, signatures.
-// Those fields are left empty here and enriched by the backfill path.
-// ---------------------------------------------------------------------------
 async fn process_shred(pool: &SqlitePool, shred: Shred) -> Result<()> {
     if !shred.transactions.is_empty() {
-        info!(
-            "Shred #{} block #{} — {} txs",
-            shred.shred_idx, shred.block_number, shred.transactions.len()
-        );
+        info!("Shred #{} block #{} — {} txs", shred.shred_idx, shred.block_number, shred.transactions.len());
     }
 
     let block_number_hex = format!("0x{:x}", shred.block_number);
@@ -163,12 +150,11 @@ async fn process_shred(pool: &SqlitePool, shred: Shred) -> Result<()> {
         let rcpt  = &shred_tx.receipt;
         let hash  = &inner.hash;
 
-        // Build Transaction
         let tx = Transaction {
             hash: hash.clone(),
-            block_hash: None,                          // not in shred
+            block_hash: None,
             block_number: Some(block_number_hex.clone()),
-            transaction_index: None,                   // not in shred
+            transaction_index: None,
             from: inner.signer.clone(),
             to: inner.to.clone(),
             value: inner.value.clone(),
@@ -188,16 +174,14 @@ async fn process_shred(pool: &SqlitePool, shred: Shred) -> Result<()> {
             continue;
         }
 
-        // Build TransactionReceipt
-        // gas_used: prefer the dedicated field; fall back to cumulative as best-effort.
         let gas_used = rcpt.gas_used.clone()
             .unwrap_or_else(|| rcpt.cumulative_gas_used.clone());
 
         let receipt = TransactionReceipt {
             transaction_hash: hash.clone(),
-            block_hash: String::new(),                 // not in shred
+            block_hash: String::new(),
             block_number: block_number_hex.clone(),
-            transaction_index: "0x0".into(),           // not in shred
+            transaction_index: "0x0".into(),
             from: inner.signer.clone(),
             to: inner.to.clone(),
             contract_address: None,
@@ -207,7 +191,7 @@ async fn process_shred(pool: &SqlitePool, shred: Shred) -> Result<()> {
                 .or_else(|| inner.max_fee_per_gas.clone()),
             status: rcpt.status.clone(),
             logs: rcpt.logs.clone(),
-            logs_bloom: "0x".into(),                   // not in shred
+            logs_bloom: "0x".into(),
             tx_type: rcpt.tx_type.clone(),
         };
         let receipt_raw = serde_json::to_string(&receipt)?;
@@ -216,16 +200,21 @@ async fn process_shred(pool: &SqlitePool, shred: Shred) -> Result<()> {
         }
     }
 
-    // Idempotent — safe to call multiple times per block (multiple shreds/block)
     db::set_latest_indexed_block(pool, shred.block_number).await?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Backfill: walk historical blocks via HTTP RPC.
-// Serves two purposes:
-//   1. Fill gaps caused by WS downtime.
-//   2. Enrich shred-indexed rows with block_hash, transaction_index, logs_bloom.
+// Backfill: walk historical blocks using eth_getBlockReceipts
+//
+// Old approach (N+1):
+//   eth_getBlockByNumber → N × eth_getTransactionReceipt
+//   = 1 + N RPC calls per block
+//
+// New approach (2 calls flat):
+//   eth_getBlockByNumber (txs)  ──┐
+//   eth_getBlockReceipts        ──┘  join by tx hash
+//   = always 2 RPC calls per block, regardless of tx count
 // ---------------------------------------------------------------------------
 async fn backfill_indexer(pool: &SqlitePool, rpc: &RpcClient, batch_size: u64) -> Result<()> {
     let current_head = rpc.get_block_number().await?;
@@ -255,7 +244,15 @@ async fn backfill_indexer(pool: &SqlitePool, rpc: &RpcClient, batch_size: u64) -
 }
 
 async fn index_block(pool: &SqlitePool, rpc: &RpcClient, block_number: u64) -> Result<()> {
-    let block = rpc.get_block_by_number(block_number).await?;
+    // Fire both requests concurrently — no reason to wait for one before the other
+    let (block_res, receipts_res) = tokio::join!(
+        rpc.get_block_by_number(block_number),
+        rpc.get_block_receipts(block_number),
+    );
+
+    let block    = block_res?;
+    let receipts = receipts_res?;   // Vec<Value>, one per tx
+
     if block.is_null() {
         warn!("Block {} not found", block_number);
         return Ok(());
@@ -271,29 +268,43 @@ async fn index_block(pool: &SqlitePool, rpc: &RpcClient, block_number: u64) -> R
         return Ok(());
     }
 
-    info!("Backfill block #{}: {} txs", block_number, txs.len());
+    info!("Backfill block #{}: {} txs, {} receipts", block_number, txs.len(), receipts.len());
+
+    // Build a hash → receipt index so the join below is O(1) per tx
+    let receipt_map: std::collections::HashMap<String, &Value> = receipts
+        .iter()
+        .filter_map(|r| {
+            r["transactionHash"].as_str().map(|h| (h.to_lowercase(), r))
+        })
+        .collect();
 
     for tx_val in &txs {
         let tx: Transaction = match serde_json::from_value(tx_val.clone()) {
             Ok(t) => t,
-            Err(e) => { warn!("parse tx failed: {:?}", e); continue; }
+            Err(e) => { warn!("parse tx: {:?}", e); continue; }
         };
 
+        // Persist transaction (full data — block_hash, index, signatures all present)
         let tx_raw = tx_val.to_string();
         if let Err(e) = db::insert_transaction(pool, &tx, &tx_raw).await {
             warn!("insert tx {}: {:?}", tx.hash, e);
             continue;
         }
 
-        match rpc.get_transaction_receipt(&tx.hash).await {
-            Ok(Some(rcpt)) => {
-                let raw = serde_json::to_string(&rcpt)?;
-                if let Err(e) = db::insert_receipt(pool, &rcpt, &raw).await {
-                    warn!("insert receipt {}: {:?}", tx.hash, e);
+        // Join with receipt from the map — no extra RPC call
+        match receipt_map.get(&tx.hash.to_lowercase()) {
+            Some(rcpt_val) => {
+                match serde_json::from_value::<TransactionReceipt>((*rcpt_val).clone()) {
+                    Ok(rcpt) => {
+                        let raw = rcpt_val.to_string();
+                        if let Err(e) = db::insert_receipt(pool, &rcpt, &raw).await {
+                            warn!("insert receipt {}: {:?}", tx.hash, e);
+                        }
+                    }
+                    Err(e) => warn!("parse receipt {}: {:?}", tx.hash, e),
                 }
             }
-            Ok(None) => warn!("no receipt for {}", tx.hash),
-            Err(e)   => warn!("fetch receipt {}: {:?}", tx.hash, e),
+            None => warn!("no receipt in block for tx {}", tx.hash),
         }
     }
 

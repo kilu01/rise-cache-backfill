@@ -10,7 +10,7 @@ path = "src/indexer.rs"
 [[bin]]
 name = "rpc-server"
 path = "src/rpc_server.rs"
- 
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["json"] }
@@ -28,3 +28,5 @@ tower-http = { version = "0.5", features = ["cors", "trace"] }
 clap = { version = "4", features = ["derive", "env"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 url = "2"
+# For thundering herd dedup: broadcast channel per in-flight key
+dashmap = "5"

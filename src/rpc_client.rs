@@ -29,8 +29,7 @@ impl RpcClient {
             "params": params,
             "id": 1
         });
-
-        debug!("RPC call: {} {:?}", method, params);
+        debug!("RPC {} {:?}", method, params);
 
         let resp: Value = self
             .client
@@ -44,46 +43,41 @@ impl RpcClient {
         if let Some(err) = resp.get("error") {
             return Err(anyhow!("RPC error: {}", err));
         }
-
         Ok(resp["result"].clone())
     }
 
     pub async fn get_transaction_by_hash(&self, hash: &str) -> Result<Option<Transaction>> {
-        let result = self
-            .call("eth_getTransactionByHash", json!([hash]))
-            .await?;
-
-        if result.is_null() {
-            return Ok(None);
-        }
-        let tx: Transaction = serde_json::from_value(result)?;
-        Ok(Some(tx))
+        let result = self.call("eth_getTransactionByHash", json!([hash])).await?;
+        if result.is_null() { return Ok(None); }
+        Ok(Some(serde_json::from_value(result)?))
     }
 
     pub async fn get_transaction_receipt(&self, hash: &str) -> Result<Option<TransactionReceipt>> {
-        let result = self
-            .call("eth_getTransactionReceipt", json!([hash]))
-            .await?;
-
-        if result.is_null() {
-            return Ok(None);
-        }
-        let receipt: TransactionReceipt = serde_json::from_value(result)?;
-        Ok(Some(receipt))
+        let result = self.call("eth_getTransactionReceipt", json!([hash])).await?;
+        if result.is_null() { return Ok(None); }
+        Ok(Some(serde_json::from_value(result)?))
     }
 
     pub async fn get_block_number(&self) -> Result<u64> {
         let result = self.call("eth_blockNumber", json!([])).await?;
         let hex = result.as_str().ok_or_else(|| anyhow!("expected string"))?;
-        let n = u64::from_str_radix(hex.trim_start_matches("0x"), 16)?;
-        Ok(n)
+        Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
     }
 
     pub async fn get_block_by_number(&self, block: u64) -> Result<Value> {
         let hex = format!("0x{:x}", block);
-        let result = self
-            .call("eth_getBlockByNumber", json!([hex, true]))
-            .await?;
-        Ok(result)
+        self.call("eth_getBlockByNumber", json!([hex, true])).await
+    }
+
+    /// Fetch all receipts for a block in ONE call — O(1) vs O(n_tx) per block.
+    /// Returns a Vec of raw receipt Values (preserves upstream format for raw_json storage).
+    pub async fn get_block_receipts(&self, block: u64) -> Result<Vec<Value>> {
+        let hex = format!("0x{:x}", block);
+        let result = self.call("eth_getBlockReceipts", json!([hex])).await?;
+        match result {
+            Value::Array(receipts) => Ok(receipts),
+            Value::Null => Ok(vec![]),
+            other => Err(anyhow!("eth_getBlockReceipts unexpected response: {}", other)),
+        }
     }
 }

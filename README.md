@@ -71,7 +71,7 @@ cargo build --release
 # Get a transaction (cache miss first time, then cache hit)
 curl -X POST http://localhost:8545 \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x4d6d91ac9e15a070f44635835ca8571249759b703314ec0328bb3e6afcafb8e8"],"id":1}'
+  -d '{"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":["0x34396566d3d7014ecdde7264809f2aaa8cd0d6882904061934246edc86227447"],"id":1}'
 
 # Get receipt
 curl -X POST http://localhost:8545 \

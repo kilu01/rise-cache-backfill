@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  indexer:
+    build: .
+    command: indexer
+    environment:
+      - DB_PATH=/data/rise.db
+      - RPC_HTTP=https://testnet.riselabs.xyz
+      - RPC_WS=wss://testnet.riselabs.xyz/ws
+      - RUST_LOG=info
+    volumes:
+      - rise-data:/data
+    restart: unless-stopped
+
+  rpc-server:
+    build: .
+    command: rpc-server
+    ports:
+      - "8545:8545"
+    environment:
+      - DB_PATH=/data/rise.db
+      - RPC_HTTP=https://testnet.riselabs.xyz
+      - LISTEN_ADDR=0.0.0.0:8545
+      - RUST_LOG=info
+    volumes:
+      - rise-data:/data
+    depends_on:
+      - indexer
+    restart: unless-stopped
+
+volumes:
+  rise-data:

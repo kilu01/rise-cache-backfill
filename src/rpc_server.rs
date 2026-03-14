@@ -268,35 +268,46 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = InflightResult> + Send + 'static,
 {
-    // Check if there's already an in-flight request for this key
-    if let Some(sender) = inflight.get(key) {
-        // Subscribe before the lock is released so we don't miss the send
-        let mut rx = sender.subscribe();
-        drop(sender); // release DashMap read lock
+    use dashmap::mapref::entry::Entry;
 
-        info!("thundering herd: waiting on in-flight request for {}", key);
-        return match rx.recv().await {
-            Ok(result) => result,
-            // Sender dropped before sending (caller panicked) — treat as error
-            Err(_) => Err("in-flight request was dropped".into()),
-        };
+    // entry() holds a write lock on the bucket for the duration of the match,
+    // making the check + insert/subscribe atomic — no two threads can both see
+    // Vacant for the same key simultaneously, which was the race condition in
+    // the previous get() + insert() approach.
+    match inflight.entry(key.to_string()) {
+        Entry::Occupied(e) => {
+            // Another task is already fetching this key — subscribe and wait.
+            // We subscribe while still holding the lock so we cannot miss the
+            // send that happens after the fetcher calls tx.send() + remove().
+            let mut rx = e.get().subscribe();
+            drop(e); // release write lock before awaiting
+
+            info!("thundering herd: coalescing request for {}", key);
+            match rx.recv().await {
+                Ok(result) => result,
+                // Sender was dropped without sending (fetcher panicked).
+                Err(_) => Err("in-flight request was dropped unexpectedly".into()),
+            }
+        }
+        Entry::Vacant(e) => {
+            // We are the designated fetcher for this key.
+            // capacity=1: we send exactly once; all current subscribers receive it.
+            let (tx, _) = broadcast::channel(1);
+            e.insert(tx.clone());
+            // Release the write lock now — new waiters can subscribe from this
+            // point on and will block on rx.recv() until we call tx.send() below.
+            drop(e);
+
+            let result = fetch_fn().await;
+
+            // Broadcast to all waiters, then remove the entry so the next
+            // cache miss starts a fresh channel.
+            let _ = tx.send(result.clone()); // ignore: no waiters is fine
+            inflight.remove(key);
+
+            result
+        }
     }
-
-    // We're the first — create a channel and insert it
-    // capacity=1: we send exactly once; lagged receivers get an error (impossible here
-    // since we subscribe before sending, but capacity>0 is required)
-    let (tx, _) = broadcast::channel(1);
-    inflight.insert(key.to_string(), tx.clone());
-
-    // Do the actual upstream fetch
-    let result = fetch_fn().await;
-
-    // Broadcast to all waiters then clean up
-    // Ignore send errors — they just mean no one was waiting
-    let _ = tx.send(result.clone());
-    inflight.remove(key);
-
-    result
 }
 
 // ---------------------------------------------------------------------------

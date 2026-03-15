@@ -124,3 +124,7 @@ indexer_state (key, value) -- tracks latest indexed block
 - **Shred-specific API**: Using standard `eth_subscribe newHeads` — if RISE exposes a proprietary shred subscription endpoint, swap in `rpc_ws` accordingly.
 - **WAL mode**: For production, enable SQLite WAL (`PRAGMA journal_mode=WAL`) to allow concurrent reads while the indexer writes.
 - **Testing/benchmarking/monitoring**: Out of scope per requirements.
+- **Use COALESCE when backfill to avoid overiding with NUL value
+- **Batch insert tx from ws
+- **Upstream Semaphore to limit different key request going upstream
+- **Exponential backoff when retry Shred WS

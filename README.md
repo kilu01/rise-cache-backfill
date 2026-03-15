@@ -55,14 +55,13 @@ docker-compose up --build
 ### Build locally
 
 ```bash
-# Requires Rust 1.76+ and libssl-dev
-cargo build --release
+export DATABASE_URL=my_database.db
 
 # Run indexer
-./target/release/indexer --db-path my_database.db --rpc-http https://testnet.riselabs.xyz --rpc-ws wss://testnet.riselabs.xyz/ws
+RUST_LOG=info cargo run --bin indexer
 
 # Run RPC server (separate terminal, same DB)
-./target/release/rpc-server --db-path my_database.db --rpc-http https://testnet.riselabs.xyz --listen-addr 0.0.0.0:8545
+RUST_LOG=info cargo run --bin rpc-server
 ```
 
 ### Test
